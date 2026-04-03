@@ -1,45 +1,46 @@
 # Author: Sneaky Celery
-# This script utilizes Open Source Intelligence(OSINT) to block known malicious IPs from
-# communicating with your system and vice-versa. This one in particular is protecting against
-# botnets.
-#
-# __ Concepts to add __________________________________________________________
-# 1. Try/Except blocks
-# 2. Conditionals
-# 3. Loops
-# 4. Error handling
-# 5. Data type conversion
-# 6. Logging
-# 7. F-strings
-# 8. BONUS: Reduce repetition with re-usable helper function. For example: run_ps
-#
-# ── Features to add ──────────────────────────────────────────────────────────
-# 1. Admin privilege check using ctypes -- exit early with clear message if not elevated.
-# 2. Minimal logging using logging.basicConfig -- one file, one summary line per run, errors and
-#    warnings logged. Log file: badip_blocker.log (append mode, ~365 lines/year).
-# 3. requests timeout -- 30 seconds to prevent indefinite stalls.
-# 4. Single retry on fetch failure -- 60 second wait between attempts, exit on second failure.
-# 5. subprocess error handling -- use -NonInteractive flag, capture output, check returncode
-#    and log PowerShell error messages on failure.
-# 6. Switch from netsh to New-NetFirewallRule and Remove-NetFirewallRule with
-#    -ErrorAction SilentlyContinue so delete step doesn't error on a fresh machine.
-# 7. Batch approach -- serialize Python ip_list into a PowerShell array literal @("ip","ip",...)
-#    and pass all IPs to New-NetFirewallRule -RemoteAddress at once. Reduces subprocess calls
-#    from 2 per IP (~800 for a 400 IP list) down to 2 total (one per direction).
-#    Example resolved command:
-#    New-NetFirewallRule -DisplayName 'BadIP' -Direction Inbound -Action Block -RemoteAddress @("1.2.3.4","5.6.7.8","9.10.11.12") -Enabled True
-# 8. BONUS: Create a helper function to simplify repetitive lines.
-# ─────────────────────────────────────────────────────────────────────────────
+# OSINT-based botnet IP blocker using Abuse CH Feodo Tracker
 
-import requests, csv, subprocess, ipaddress
+import requests, csv, subprocess, ipaddress, ctypes, sys, logging, time
 
-# Source=Abuse CH
-response = requests.get("https://feodotracker.abuse.ch/downloads/ipblocklist.csv").text
+def is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except Exception:
+        return False
 
-# Filter out comments
+if not is_admin():
+    print("Error: Administrator privileges required.")
+    sys.exit(1)
+
+# Simple logging file
+logging.basicConfig(
+    filename="badip_blocker.log",
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
+# Fetch the known malicious IPs for the day.
+for attempt in range(2):
+    try:
+        response = requests.get(
+            "https://feodotracker.abuse.ch/downloads/ipblocklist.csv",
+            timeout=30      # prevent indefinite stalls with 1 reattempt
+        ).text
+        break
+    except requests.RequestException as e:
+        if attempt == 0:
+            msg = f"Fetch attempt 1 failed: {e}. \nRetrying in 60 seconds."
+            print(msg); logging.warning(msg)
+            time.sleep(60)
+        else:
+            msg = f"Fetch attempt 2 failed: {e}. \nExiting."
+            print(msg); logging.error(msg)
+            sys.exit(1)
+
+# Parse and validate format/content
 mycsv = csv.reader(filter(lambda x: not x.startswith("#"), response.splitlines()))
-
-# Verify that the expected IP addresses are found in the csv file before continuing.
 ip_list = []
 for row in mycsv:
     if len(row) > 1 and row[1].count(".") == 3:
@@ -51,17 +52,39 @@ for row in mycsv:
             continue
 
 if not ip_list:
-    print("No valid IP address found. Exiting script.")
-    exit(1)
+    msg = "No valid IPs found in blocklist."
+    print(msg); logging.warning(msg)
+    sys.exit(1)
 
-# Delete existing firewall rules
-rule = "netsh advfirewall firewall delete rule name='BadIP'"
-subprocess.run(["Powershell", "-Command", rule])
+# Helper: run PowerShell command and return result
+def run_ps(command):
+    return subprocess.run(
+        ["PowerShell", "-NonInteractive", "-Command", command],
+        capture_output=True, text=True
+    )
 
-# Create new firewall rules for inbound and outbound traffic
-for ip in ip_list:
-    print("Added Rule to block ", ip)
-    rule = "netsh advfirewall firewall add rule name='BadIP' Dir=Out Action=Block RemoteIP=" + ip
-    subprocess.run(["Powershell", "-Command", rule])
-    rule = "netsh advfirewall firewall add rule name='BadIP' Dir=In Action=Block RemoteIP=" + ip
-    subprocess.run(["Powershell", "-Command", rule])
+# Delete the old rules
+run_ps("Remove-NetFirewallRule -DisplayName 'BadIP' -ErrorAction SilentlyContinue")
+
+# Converts ip_list into a PowerShell array literal: @("1.2.3.4","5.6.7.8",...)
+ip_array = "@(" + ",".join(f'"{ip}"' for ip in ip_list) + ")"
+
+'''
+Builds and runs two PowerShell commands, one per direction, each passing all IPs at once.
+Example of the resolved command for one direction:
+New-NetFirewallRule -DisplayName 'BadIP' -Direction Inbound -Action Block -RemoteAddress @("1.2.3.4","5.6.7.8","9.10.11.12") -Enabled True
+'''
+for direction in ("Inbound", "Outbound"):
+    cmd = (
+        f"New-NetFirewallRule -DisplayName 'BadIP' -Direction {direction} "
+        f"-Action Block -RemoteAddress {ip_array} -Enabled True"
+    )
+    result = run_ps(cmd)
+    if result.returncode != 0:
+        msg = f"Failed to create {direction} rule: {result.stderr.strip()}"
+        print(msg); logging.error(msg)
+        sys.exit(1)
+
+summary = f"Rules updated: {len(ip_list)} IPs blocked (Inbound + Outbound)."
+print(summary)
+logging.info(summary)
